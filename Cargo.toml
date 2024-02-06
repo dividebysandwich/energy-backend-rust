@@ -1,0 +1,22 @@
+[package]
+name = "energy-backend-rust"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+chrono = "0.4.33"
+ctrlc = "3.4.2"
+influxdb = "0.7.1"
+regex = "1.10.3"
+reqwest = { version = "0.11.24", features = ["blocking"] }
+serde = { version = "1.0.196", features = ["derive"] }
+serde_json = "1.0.113"
+ssh2 = "0.9.4"
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
