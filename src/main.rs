@@ -4,7 +4,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::env;
 use ssh2::Session;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Result;
 use regex::Regex;
 use std::time::SystemTime;
@@ -12,7 +12,8 @@ use std::thread;
 use std::time;
 use chrono::Local;
 use std::fs::File;
-use std::io::{BufReader, BufRead};
+use std::io::{BufReader, BufRead, Error, ErrorKind, Result as IOResult};
+#[allow(unused_mut)]
 
 #[derive(Serialize, Deserialize)]
 struct EnergyData {
@@ -67,6 +68,22 @@ struct EnergyData {
     pub grid_reverse_l2: f64,
     #[serde(rename = "GridReverseL3")]
     pub grid_reverse_l3: f64,
+    #[serde(rename = "TemperatureBatteryRoom")]
+    pub temperature_battery_room: f64,
+    #[serde(rename = "HumidityBatteryRoom")]
+    pub humidity_battery_room: f64,
+    #[serde(rename = "TemperatureOutside")]
+    pub temperature_outside: f64,
+    #[serde(rename = "HumidityOutside")]
+    pub humidity_outside: f64,
+    #[serde(rename = "Temperature1")]
+    pub temperature_1: f64,
+    #[serde(rename = "Humidity1")]
+    pub humidity_1: f64,
+    #[serde(rename = "Temperature2")]
+    pub temperature_2: f64,
+    #[serde(rename = "Humidity2")]
+    pub humidity_2: f64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -102,12 +119,12 @@ struct InverterData {
     pub Ac_Grid_L2_Power: f64,
     #[serde(rename = "Ac/Grid/L3/Power")]
     pub Ac_Grid_L3_Power: f64,
-    #[serde(rename = "Ac/PvOnGrid/L1/Power")]
-    pub Ac_PvOnGrid_L1_Power: f64,
-    #[serde(rename = "Ac/PvOnGrid/L2/Power")]
-    pub Ac_PvOnGrid_L2_Power: f64,
-    #[serde(rename = "Ac/PvOnGrid/L3/Power")]
-    pub Ac_PvOnGrid_L3_Power: f64,
+    #[serde(rename = "Ac/PvOnGrid/L1/Power", default, deserialize_with = "deserialize_float_or_empty_as_option")]
+    pub Ac_PvOnGrid_L1_Power: Option<f64>,
+    #[serde(rename = "Ac/PvOnGrid/L2/Power", default, deserialize_with = "deserialize_float_or_empty_as_option")]
+    pub Ac_PvOnGrid_L2_Power:  Option<f64>,
+    #[serde(rename = "Ac/PvOnGrid/L3/Power", default, deserialize_with = "deserialize_float_or_empty_as_option")]
+    pub Ac_PvOnGrid_L3_Power:  Option<f64>,
     #[serde(rename = "Dc/Battery/Soc")]
     pub Dc_Battery_Soc: f64,
     #[serde(rename = "Dc/Battery/Power")]
@@ -147,6 +164,22 @@ struct MeterData {
     pub Ac_L3_Energy_Reverse: f64,
 }
 
+fn deserialize_float_or_empty_as_option<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FloatOrEmpty {
+        Float(f64),
+        Empty(Vec<()>),
+    }
+
+    match FloatOrEmpty::deserialize(deserializer)? {
+        FloatOrEmpty::Float(f) => Ok(Some(f)),
+        FloatOrEmpty::Empty(_) => Ok(None),
+    }
+}
 
 fn get_sys_time_in_msecs() -> u128 {
     match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
@@ -169,19 +202,68 @@ fn write_value_to_file(filename: &str, value: &str, append: bool) {
     file.write_all("\n".as_bytes()).unwrap();
 }
 
-// Fix the json returned by the victron controller.
-fn fix_victron_json(json: &str) -> String {
-    let mut fixed_json = json.replace("'", "\"");
-    // I have no patience to deal with the available batteries data, so I'm just going to remove it
-    let pattern = Regex::new(&format!(r"\b{}\b", regex::escape("AvailableBatteries"))).unwrap();
-    let filtered_lines: Vec<&str> = fixed_json.lines().filter(|line| !pattern.is_match(line)).collect();
-    fixed_json = filtered_lines.join("\n"); // Join the remaining lines back together
-    fixed_json = fixed_json.replace("\"AvailableBatteryServices\": \"{\"", "\"AvailableBatteryServices\": {\"");
+// Convert python dict string to a json string
+fn dict_to_json(json: &str) -> String {
+
+    // Step 1: Join all lines into one line
+    let single_line = json
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Step 2: Remove trailing commas (optional but helps for safety)
+    let cleaned = single_line.trim_end_matches(',');
+
+    // Step 3: Convert Python-style dict to JSON-compatible format
+    // - Replace single quotes with double quotes
+    // - Collapse adjacent quoted words into one string
+    let re_multiline_str = Regex::new(r"'([^']*?)'\s+'").unwrap();
+    let mut intermediate = cleaned.to_string();
+
+    // Collapse `'foo' 'bar'` into `'foo bar'`
+    while re_multiline_str.is_match(&intermediate) {
+        intermediate = re_multiline_str
+            .replace_all(&intermediate, "'$1 ")
+            .to_string();
+    }
+
+    // Replace all single quotes with double quotes
+    let json_like = intermediate.replace('\'', "\"");
+    let mut fixed_json = json_like.replace("\"{\"", "{\"");
+    fixed_json = fixed_json.replace("}\"", "}");
     fixed_json = fixed_json.replace("value = ", "");
     fixed_json = fixed_json.replace(": True", ": \"TRUE\"");
     fixed_json = fixed_json.replace(": False", ": \"FALSE\"");
     fixed_json = fixed_json.replace("\"}\",", "\"},");
+
+    // Wrap as object (if needed)
+//    let wrapped_json = format!("{{{}}}", json_like);
+
     fixed_json
+}
+
+
+fn read_first_line_as_float(filename: &str) -> IOResult<f64> {
+    let file = File::open(filename)?;
+    let reader = BufReader::new(file);
+    
+    // Read the first line
+    let first_line = match reader.lines().next() {
+        Some(Ok(line)) => line,
+        _ => return Err(Error::new(ErrorKind::Other, "File is empty")),
+    };
+
+    // Check if the first line equals "None"
+    if first_line.trim() == "None" {
+        Ok(0.0)
+    } else {
+        // Parse the first line as a float
+        match first_line.trim().parse::<f64>() {
+            Ok(value) => Ok(value),
+            Err(_) => Err(Error::new(ErrorKind::InvalidData, "Invalid float value")),
+        }
+    }
 }
 
 fn read_history_from_file(filename: &str) -> Vec<f64> {
@@ -204,33 +286,33 @@ fn read_history_from_file(filename: &str) -> Vec<f64> {
 
 fn fetch_and_process(sess: Session) {
     let mut channel1 = sess.channel_session().unwrap();
-    // Get data from Victron controller
     channel1.exec("nice -n 10 dbus -y com.victronenergy.system / GetValue").unwrap();
     let mut inverter_data_raw = String::new();
     channel1.read_to_string(&mut inverter_data_raw).unwrap();
-    //    println!("{}", inverter_data_raw);
+    println!("{}", dict_to_json(&inverter_data_raw));
     let _ = channel1.wait_close();
-    let res1: Result<InverterData> = serde_json::from_str(fix_victron_json(&inverter_data_raw).as_str());
+
+    let res1: Result<InverterData> = serde_json::from_str(dict_to_json(&inverter_data_raw).as_str());
     match res1 {
         Ok(inverter_result) => {
             let mut channel2 = sess.channel_session().unwrap();
-            // Get some more information from a connected energy meter. This is optional.
-            channel2.exec("nice -n 10 dbus -y com.victronenergy.grid.cgwacs_ttyUSB0_di32_mb1 / GetValue").unwrap();
+            channel2.exec("nice -n 10 dbus -y com.victronenergy.grid.cgwacs_ttyUSB0_mb1 / GetValue").unwrap();
             let mut energymeter_data_raw = String::new();
             channel2.read_to_string(&mut energymeter_data_raw).unwrap();
         //    println!("{}", energymeter_data_raw);
             let _ = channel2.wait_close();
-    
-            let res2: Result<MeterData> = serde_json::from_str(fix_victron_json(&energymeter_data_raw).as_str());
+            let energymeter_data = dict_to_json(&energymeter_data_raw);
+            let res2: Result<MeterData> = serde_json::from_str(&energymeter_data);
             match res2 {
                 Ok(meter_result) => {
                     // Now we have both inverter and energy meter results, so we can process the data
 
-                    let mut value_pv = inverter_result.Ac_PvOnGrid_L1_Power + inverter_result.Ac_PvOnGrid_L2_Power + inverter_result.Ac_PvOnGrid_L3_Power;
+                    let mut value_pv = inverter_result.Ac_PvOnGrid_L1_Power.unwrap_or(0.0) + inverter_result.Ac_PvOnGrid_L2_Power.unwrap_or(0.0) + inverter_result.Ac_PvOnGrid_L3_Power.unwrap_or(0.0);
+                    let mut value_grid = inverter_result.Ac_Grid_L1_Power + inverter_result.Ac_Grid_L2_Power + inverter_result.Ac_Grid_L3_Power;
                     if value_pv < 0.0 {
                         value_pv = 0.0;
                     }
-                    let value_consumption = inverter_result.Ac_Consumption_L1_Power + inverter_result.Ac_Consumption_L2_Power + inverter_result.Ac_Consumption_L3_Power;
+                    let mut value_consumption = inverter_result.Ac_Consumption_L1_Power + inverter_result.Ac_Consumption_L2_Power + inverter_result.Ac_Consumption_L3_Power;
                     let mut value_efficiency = 100.0;
                     let mut value_losses = 0.0;
                     if value_pv > value_consumption {
@@ -247,14 +329,54 @@ fn fetch_and_process(sess: Session) {
                         }
                     }
 
+                    //When feeding into the grid, the system adds the grid feed to the consumption so we need to substract
+                    if value_grid < 0.0 {
+                        // using addition because value_grid will be negative
+                        value_consumption = value_consumption + value_grid;
+                    }
+
+
+                    let path_to_files = "/var/www/html/status/";
+                    //let path_to_files = "./";
+
+                    let mut temperature_1 = 0.0;
+                    let mut temperature_2 = 0.0;
+                    let mut temperature_i = 0.0;
+                    let mut temperature_o = 0.0;
+                    let mut humidity_1 = 0.0;
+                    let mut humidity_2 = 0.0;
+                    let mut humidity_i = 0.0;
+                    let mut humidity_o = 0.0;
+
+                    //Enable this if you have temperature sensors available
+//                    let temperature_1 = trim(file_get_contents('/var/www/html/status/temp_1.txt'));
+//                    let humidity_1 = trim(file_get_contents('/var/www/html/status/humi_1.txt'));
+//                    let temperature2 = trim(file_get_contents('/var/www/html/status/temp_2.txt'));
+//                    let humidity2 = trim(file_get_contents('/var/www/html/status/humi_2.txt'));
+//                    let temperature_i = trim(file_get_contents('/var/www/html/status/tempi.txt'));
+//                    let humidity_i = trim(file_get_contents('/var/www/html/status/humii.txt'));
+//                    let temperature_o = trim(file_get_contents('/var/www/html/status/tempo.txt'));
+//                    let humidity_o = trim(file_get_contents('/var/www/html/status/humio.txt'));
+
+                    match read_first_line_as_float(format!("{}temp_1.txt", &path_to_files).as_str()) {
+                        Ok(line) => temperature_1 = line,
+                        Err(_) => {},
+                    }
+
+                    let mut consumption = value_consumption;
+                    // Charging the battery is included in the AC load figure on systems where the ESS is externally controlled by the PV inverter
+                    if inverter_result.Dc_Battery_Power > 0.0 {
+                        consumption = value_consumption - inverter_result.Dc_Battery_Power;
+                    }
+
                     let energy_data = EnergyData {
                         time: get_sys_time_in_msecs(),
                         grid: inverter_result.Ac_Grid_L1_Power + inverter_result.Ac_Grid_L2_Power + inverter_result.Ac_Grid_L3_Power,
                         pv: value_pv,
-                        consumption: value_consumption,
+                        consumption: consumption,
                         efficiency: value_efficiency,
                         losses: value_losses,
-                        actual_consumption: value_consumption,
+                        actual_consumption: consumption,
                         battery_soc: inverter_result.Dc_Battery_Soc,
                         battery_voltage: inverter_result.Dc_Battery_Voltage,
                         battery_current: inverter_result.Dc_Battery_Current,
@@ -274,13 +396,21 @@ fn fetch_and_process(sess: Session) {
                         grid_reverse_l1: meter_result.Ac_L1_Energy_Reverse,
                         grid_reverse_l2: meter_result.Ac_L2_Energy_Reverse,
                         grid_reverse_l3: meter_result.Ac_L3_Energy_Reverse,
+                        temperature_battery_room: temperature_i,
+                        humidity_battery_room: humidity_i,
+                        temperature_outside: temperature_o,
+                        humidity_outside: humidity_o,
+                        temperature_1: temperature_1,
+                        humidity_1: humidity_1,
+                        temperature_2: temperature_2,
+                        humidity_2: humidity_2,
                     };
                     let current_time = Local::now();
                     // Store data in Elasticsearch
-                    // Useful if you want to do kibana dashboards for example
                     let result = serde_json::to_string(&energy_data);
                     match result {
                         Ok(json_result) => {
+//                            println!("Data: {}", json_result);
                             let client = reqwest::blocking::Client::new();
                             match client.post("http://elasticsearch:9200/power/_doc")
                                 .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -302,8 +432,6 @@ fn fetch_and_process(sess: Session) {
                         }
                     }
 
-                    // Replace this with the path to the web directory of your local webserver, if you want to access the .txt files directly.
-                    let path_to_files = "/var/www/html/status/";
 
                     let compact_energy_data = CompactEnergyData {
                         time: current_time.format("%H:%M").to_string(),
@@ -328,7 +456,7 @@ fn fetch_and_process(sess: Session) {
                     let result = serde_json::to_string(&compact_energy_data);
                     match result {
                         Ok(json_result) => {
-                            //println!("CompactEnergy: {}", json_result);
+                            println!("CompactEnergy: {}", json_result);
                             let client = reqwest::blocking::Client::new();
                             match client.post("https://yourserver.com/updateEnergy")
                                 .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -348,7 +476,7 @@ fn fetch_and_process(sess: Session) {
                         }
                     }
 
-                    // This is a single file containing just the most important current values. Nice for use with tiny microcontrollers.
+                    // This is a single file containing just the most important current values
                     write_value_to_file(format!("{}soc.txt", &path_to_files).as_str(), (format!("{:.0}", energy_data.battery_soc)).as_str(), false);
                     write_value_to_file(format!("{}soc.txt", &path_to_files).as_str(), (format!("{:.1}", energy_data.pv/1000.0)).as_str(), true);
                     write_value_to_file(format!("{}soc.txt", &path_to_files).as_str(), (format!("{:.1}", energy_data.actual_consumption/1000.0)).as_str(), true);
@@ -358,26 +486,25 @@ fn fetch_and_process(sess: Session) {
                     write_value_to_file(format!("{}soc.txt", &path_to_files).as_str(), current_time.format("%e %B %Y").to_string().as_str(), true);
                     println!("Energy loop done: {}", current_time.format("%H:%M:%S").to_string());
                     // These are individual history files that grow over time. Each minute, a cronjob calculates the average and stores that into another history file.
-                    // Use vrm_histogram.php from the energy_backend repository to process these files. Or replace this with something using elastic or another database.
                     write_value_to_file(format!("{}pv_w.txt", &path_to_files).as_str(), energy_data.pv.round().to_string().as_str(), true);
                     write_value_to_file(format!("{}use_w.txt", &path_to_files).as_str(), energy_data.actual_consumption.round().to_string().as_str(), true);
                     write_value_to_file(format!("{}grid_w.txt", &path_to_files).as_str(), energy_data.grid.round().to_string().as_str(), true);
                     write_value_to_file(format!("{}battsoc_w.txt", &path_to_files).as_str(), energy_data.battery_soc.round().to_string().as_str(), true);
                     write_value_to_file(format!("{}battuse_w.txt", &path_to_files).as_str(), energy_data.battery_power.round().to_string().as_str(), true);
 
-                    
-
                 }
                 Err(e) => {
+//                    let path = err.path().to_string();
                     println!("Received energy meter data: {}", energymeter_data_raw);
-                    println!("Error: {}", e);
+                    println!("Error parsing energy meter data: {}", e);
                 }
             }
 
         }
         Err(e) => {
             println!("Received inverter meter data: {}", inverter_data_raw);
-            println!("Error: {}", e);
+//            let path = err.path().to_string();
+                    println!("Error parsing inverter data: {}", e);
         }
     }
 }
@@ -411,5 +538,6 @@ fn main() {
         }
     }
 
+//    println!("{}", channel.exit_status().unwrap());
 }
 
