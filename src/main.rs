@@ -13,6 +13,9 @@ use std::time;
 use chrono::Local;
 use std::fs::File;
 use std::io::{BufReader, BufRead, Error, ErrorKind, Result as IOResult};
+use actix_web::{web, App, HttpServer, HttpResponse, Responder};
+use std::sync::{Arc, Mutex};
+
 #[allow(unused_mut)]
 
 #[derive(Serialize, Deserialize)]
@@ -172,7 +175,7 @@ where
     #[serde(untagged)]
     enum FloatOrEmpty {
         Float(f64),
-        Empty(Vec<()>),
+        Empty(()),
     }
 
     match FloatOrEmpty::deserialize(deserializer)? {
@@ -284,7 +287,13 @@ fn read_history_from_file(filename: &str) -> Vec<f64> {
     result
 }
 
-fn fetch_and_process(sess: Session) {
+fn fetch_and_process(
+    sess: Session, 
+    shared_data: Arc<Mutex<String>>, 
+    es_url: &str, 
+    es_user: &str, 
+    es_pass: &str
+) {
     let mut channel1 = sess.channel_session().unwrap();
     channel1.exec("nice -n 10 dbus -y com.victronenergy.system / GetValue").unwrap();
     let mut inverter_data_raw = String::new();
@@ -308,7 +317,7 @@ fn fetch_and_process(sess: Session) {
                     // Now we have both inverter and energy meter results, so we can process the data
 
                     let mut value_pv = inverter_result.Ac_PvOnGrid_L1_Power.unwrap_or(0.0) + inverter_result.Ac_PvOnGrid_L2_Power.unwrap_or(0.0) + inverter_result.Ac_PvOnGrid_L3_Power.unwrap_or(0.0);
-                    let mut value_grid = inverter_result.Ac_Grid_L1_Power + inverter_result.Ac_Grid_L2_Power + inverter_result.Ac_Grid_L3_Power;
+                    let value_grid = inverter_result.Ac_Grid_L1_Power + inverter_result.Ac_Grid_L2_Power + inverter_result.Ac_Grid_L3_Power;
                     if value_pv < 0.0 {
                         value_pv = 0.0;
                     }
@@ -340,13 +349,13 @@ fn fetch_and_process(sess: Session) {
                     //let path_to_files = "./";
 
                     let mut temperature_1 = 0.0;
-                    let mut temperature_2 = 0.0;
-                    let mut temperature_i = 0.0;
-                    let mut temperature_o = 0.0;
-                    let mut humidity_1 = 0.0;
-                    let mut humidity_2 = 0.0;
-                    let mut humidity_i = 0.0;
-                    let mut humidity_o = 0.0;
+                    let temperature_2 = 0.0;
+                    let temperature_i = 0.0;
+                    let temperature_o = 0.0;
+                    let humidity_1 = 0.0;
+                    let humidity_2 = 0.0;
+                    let humidity_i = 0.0;
+                    let humidity_o = 0.0;
 
                     //Enable this if you have temperature sensors available
 //                    let temperature_1 = trim(file_get_contents('/var/www/html/status/temp_1.txt'));
@@ -412,10 +421,10 @@ fn fetch_and_process(sess: Session) {
                         Ok(json_result) => {
 //                            println!("Data: {}", json_result);
                             let client = reqwest::blocking::Client::new();
-                            match client.post("http://elasticsearch:9200/power/_doc")
+                            match client.post(es_url)
                                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                                 .header(reqwest::header::CONTENT_LENGTH, json_result.len())
-                                .basic_auth("user", Some("pass"))
+                                .basic_auth(es_user, Some(es_pass))
                                 .body(json_result)
                                 .timeout(std::time::Duration::from_secs(10))
                                 .send() {
@@ -451,29 +460,13 @@ fn fetch_and_process(sess: Session) {
                         battuse_histogram: read_history_from_file(format!("{}lastbattuse.txt", &path_to_files).as_str()),
                     };
 
-                    // Send compact data to a small redistribution service
-                    // This could be a small REST endpoint that takes this data and regurgitates it on request.
-                    let result = serde_json::to_string(&compact_energy_data);
-                    match result {
-                        Ok(json_result) => {
-                            println!("CompactEnergy: {}", json_result);
-                            let client = reqwest::blocking::Client::new();
-                            match client.post("https://yourserver.com/updateEnergy")
-                                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                                .header(reqwest::header::CONTENT_LENGTH, json_result.len())
-                                .body(json_result)
-                                .timeout(std::time::Duration::from_secs(10))
-                                .send() {
-                                Ok(_) => {
-                                }
-                                Err(e) => {
-                                    println!("Error: {}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            println!("Error: {}", e);
-                        }
+                    match serde_json::to_string(&compact_energy_data) {
+                        Ok(json_str) => {
+                            // Lock the mutex and replace the string with the new JSON
+                            let mut data = shared_data.lock().unwrap();
+                            *data = json_str;
+                        },
+                        Err(e) => println!("Error serializing compact data: {}", e),
                     }
 
                     // This is a single file containing just the most important current values
@@ -509,35 +502,74 @@ fn fetch_and_process(sess: Session) {
     }
 }
 
+// Actix Handler: Reads the shared JSON and returns it
+async fn get_energy(data: web::Data<Mutex<String>>) -> impl Responder {
+    let json_str = data.lock().unwrap();
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .body(json_str.clone())
+}
 
-
-fn main() {
-    ctrlc::set_handler(move || {
-        println!("received Ctrl+C!");
-        std::process::exit(0);
-    }).expect("Error setting Ctrl-C handler");
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
 
     let args: Vec<String> = env::args().collect();
-    let victron_address = &args[1];
-    let victron_username = &args[2];
-    let victron_password = &args[3];
-
-    #[allow(while_true)]
-    while true {
-        // Connect to the Victron's Beaglebone controller
-        // Remember to enable root SSH access on the Beaglebone via the Victron GUI
-        let tcp = TcpStream::connect(victron_address).unwrap();
-        let mut sess = Session::new().unwrap();
-        sess.set_tcp_stream(tcp);
-        sess.handshake().unwrap();
-        sess.userauth_password(&victron_username, &victron_password).unwrap();
-        #[allow(while_true)]
-        while true {
-            fetch_and_process(sess.clone());
-            thread::sleep(time::Duration::from_secs(2));
-        }
+    if args.len() < 7 {
+        eprintln!("Usage: {} <victron-address> <victron-user> <victron-pass> <elasticsearch-url> <es-user> <es-pass>", args[0]);
+        std::process::exit(1);
     }
+    let victron_address = args[1].clone();
+    let victron_username = args[2].clone();
+    let victron_password = args[3].clone();
+    let es_url = args[4].clone();
+    let es_user = args[5].clone();
+    let es_pass = args[6].clone();
 
-//    println!("{}", channel.exit_status().unwrap());
+    let shared_state = Arc::new(Mutex::new("{}".to_string()));
+    let background_state = shared_state.clone();
+    
+    thread::spawn(move || {
+        loop {
+            // Reconnect logic loop
+            println!("Connecting to Victron at {}...", victron_address);
+            if let Ok(tcp) = TcpStream::connect(&victron_address) {
+                if let Ok(mut sess) = Session::new() {
+                    sess.set_tcp_stream(tcp);
+                    if sess.handshake().is_ok() {
+                        if sess.userauth_password(&victron_username, &victron_password).is_ok() {
+                            println!("SSH Connected. Starting fetch loop.");
+                            
+                            // Inner loop: Fetch data continuously
+                            loop {
+                                fetch_and_process(
+                                    sess.clone(), 
+                                    background_state.clone(),
+                                    &es_url, 
+                                    &es_user, 
+                                    &es_pass
+                                );
+                                thread::sleep(time::Duration::from_secs(2));
+                            }
+                        }
+                    }
+                }
+            }
+            // If connection failed or inner loop broke, wait before retrying
+            println!("Connection lost or failed, retrying in 5 seconds...");
+            thread::sleep(time::Duration::from_secs(5));
+        }
+    });
+
+    println!("Starting web server at http://0.0.0.0:8300");
+    
+    HttpServer::new(move || {
+        App::new()
+            // Pass the original Arc to Actix. `web::Data::from` wraps it automatically.
+            .app_data(web::Data::from(shared_state.clone()))
+            .route("/getEnergy", web::get().to(get_energy))
+    })
+    .bind(("0.0.0.0", 8300))?
+    .run()
+    .await
 }
 
