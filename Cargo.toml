@@ -1,19 +1,19 @@
 [package]
 name = "energy-backend-rust"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-chrono = "0.4.42"
-ctrlc = "3.5.1"
-regex = "1.12.2"
-reqwest = { version = "0.13.1", features = ["blocking", "json"] }
+chrono = "0.4.45"
+ctrlc = "3.5.2"
+regex = "1.12.4"
+reqwest = { version = "0.13.4", features = ["blocking", "json"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.148"
+serde_json = "1.0.150"
 ssh2 = "0.9.5"
-actix-web = "4"
+actix-web = "4.13.0"
 
 [profile.dev]
 opt-level = 0

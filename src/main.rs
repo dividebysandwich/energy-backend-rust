@@ -16,6 +16,12 @@ use std::thread;
 use std::time;
 use std::time::SystemTime;
 
+// SOC-driven control of the device's "Relay 1" (Victron GUI), which is dbus index 0.
+// The relay's Function must be set to "Manual" in the Victron settings for SetValue to hold.
+const RELAY_PATH: &str = "/Relay/0/State";
+const RELAY_SOC_ON: f64 = 98.0; // switch ON above this SOC
+const RELAY_SOC_OFF: f64 = 97.0; // switch OFF below this SOC
+
 #[allow(unused_mut)]
 #[derive(Serialize, Deserialize)]
 struct EnergyData {
@@ -293,6 +299,73 @@ fn read_history_from_file(filename: &str) -> Vec<f64> {
     result
 }
 
+// Run an arbitrary command on the Victron over SSH and return its trimmed stdout.
+// Mirrors the exec/read pattern used for the dbus GetValue queries below.
+fn run_remote(sess: &Session, command: &str) -> IOResult<String> {
+    let mut channel = sess.channel_session()?;
+    channel.exec(command)?;
+    let mut out = String::new();
+    channel.read_to_string(&mut out)?;
+    let _ = channel.wait_close();
+    Ok(out.trim().to_string())
+}
+
+// Drive Relay 1 from the battery SOC using a hysteresis dead-band:
+//   SOC > RELAY_SOC_ON  -> ON
+//   SOC < RELAY_SOC_OFF -> OFF
+//   in between          -> leave unchanged
+// The current relay state is read from the device so we only write on an actual change.
+fn update_relay_for_soc(sess: &Session, soc: f64) {
+    let desired_on = if soc > RELAY_SOC_ON {
+        Some(true)
+    } else if soc < RELAY_SOC_OFF {
+        Some(false)
+    } else {
+        None
+    };
+    let desired_on = match desired_on {
+        Some(d) => d,
+        None => return, // within the dead-band, keep current state
+    };
+
+    // GetValue on a single path returns just the value, e.g. "0" or "1".
+    let current_on = match run_remote(
+        sess,
+        &format!("dbus -y com.victronenergy.system {} GetValue", RELAY_PATH),
+    ) {
+        // dbus may return the value bare ("0") or quoted ("'1'"), so strip quotes/whitespace.
+        Ok(s) => s.trim_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace()) == "1",
+        Err(e) => {
+            println!("Relay: failed to read state: {}", e);
+            return;
+        }
+    };
+
+    if current_on == desired_on {
+        return; // already in the right state, nothing to do
+    }
+
+    let value = if desired_on { 1 } else { 0 };
+    // The relay state is an int32; it MUST be written with an explicit type, otherwise
+    // Venus OS treats it as a string and reverts to the previous value within ~2s.
+    // `dbus -y SetValue` does not type the value, so use dbus-send with variant:int32.
+    match run_remote(
+        sess,
+        &format!(
+            "dbus-send --system --print-reply --dest=com.victronenergy.system {} \
+             com.victronenergy.BusItem.SetValue variant:int32:{}",
+            RELAY_PATH, value
+        ),
+    ) {
+        Ok(_) => println!(
+            "Relay 1 switched {} (SOC {:.1}%)",
+            if desired_on { "ON" } else { "OFF" },
+            soc
+        ),
+        Err(e) => println!("Relay: failed to set state: {}", e),
+    }
+}
+
 fn fetch_and_process(
     sess: Session,
     shared_data: Arc<Mutex<String>>,
@@ -313,6 +386,10 @@ fn fetch_and_process(
         serde_json::from_str(dict_to_json(&inverter_data_raw).as_str());
     match res1 {
         Ok(inverter_result) => {
+            // Drive Relay 1 from SOC before the meter query, so relay control still
+            // runs even if the energy-meter read/parse later fails.
+            update_relay_for_soc(&sess, inverter_result.Dc_Battery_Soc);
+
             let mut channel2 = sess.channel_session().unwrap();
             channel2
                 .exec("nice -n 10 dbus -y com.victronenergy.grid.cgwacs_ttyUSB0_mb1 / GetValue")
